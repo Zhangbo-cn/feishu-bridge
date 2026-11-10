@@ -57,6 +57,8 @@ ARM_RE = re.compile(r"\[arm ([0-9\-: ]+)\] (\S+) =")
 RUN_RE = re.compile(r"\[run\s+([0-9\-: ]+)\] (\S+) 全量开跑")
 DONE_RE = re.compile(r"\[done ([0-9\-: ]+)\] (\S+) 退出码 (\d+)")
 STAGE_RE = re.compile(r"\[stage done ([0-9\-: ]+)\] (\w+)")
+# 自动接力脚本 (chain_*.sh) 的进度行, 整行原样转发
+CHAIN_RE = re.compile(r"\[chain ([0-9\-: ]+)\] (.+)")
 GATE_RE = re.compile(r"\[gate\] 显存空闲 (\d+)MiB")
 EVAL_RE = re.compile(r"'eval_loss':\s*'([\d.]+)'[^}]{0,200}?'epoch':\s*'([\d.]+)'")
 STEP_RE = re.compile(r"(\d+)/(\d+) \[([0-9]+:[0-9:]+)<([0-9:?]+),\s*([\d.]+)(s/it|it/s)\]")
@@ -95,16 +97,21 @@ def parse(text: str) -> dict:
     body = (text or "").replace("\r", "\n")
     out: dict = {"arm": "", "arm_ts": "", "run": "", "run_ts": "",
                  "done": [], "stage_done": [], "evals": [], "gate": "",
-                 "step": 0, "total": 0, "sit": 0.0, "elapsed": "", "bad": []}
+                 "step": 0, "total": 0, "sit": 0.0, "elapsed": "", "bad": [], "chain": []}
     for m in ARM_RE.finditer(body):
         out["arm"], out["arm_ts"] = m.group(2), m.group(1).strip()
+        out["arm_pos"] = m.end()
     for m in RUN_RE.finditer(body):
         out["run"], out["run_ts"] = m.group(2), m.group(1).strip()
     out["done"] = [(m.group(1).strip(), m.group(2), int(m.group(3)))
                    for m in DONE_RE.finditer(body)]
     out["stage_done"] = [(m.group(1).strip(), m.group(2))
                          for m in STAGE_RE.finditer(body)]
+    out["chain"] = [(m.group(1).strip(), m.group(2).strip()) for m in CHAIN_RE.finditer(body)]
     out["evals"] = [(m.group(1), m.group(2)) for m in EVAL_RE.finditer(body)]
+    # 当前臂的 eval: 只取最后一个 [arm] 标记之后的
+    out["arm_evals"] = [(m.group(1), m.group(2))
+                        for m in EVAL_RE.finditer(body, out.get("arm_pos", 0))]
     gates = GATE_RE.findall(body)
     if gates:
         out["gate"] = gates[-1]
@@ -172,8 +179,10 @@ def fmt_eval(evals: list[tuple[str, str]], keep: int = 3) -> str:
 def status_text(name: str, p: dict) -> str:
     arm = p["arm"] or p["run"] or (p["done"][-1][1] if p["done"] else "")
     head = f"[{name}] {arm or '未知臂'}"
-    if p["done"]:
-        ts, arm, code = p["done"][-1]
+    # 日志里可能有好几个臂: 结束状态只看当前臂自己的 [done]
+    mine = [d for d in p["done"] if d[1] == arm]
+    if mine:
+        ts, _, code = mine[-1]
         head += f" 已结束 退出码 {code} ({ts[11:16]})"
     else:
         head += " 运行中"
@@ -187,7 +196,7 @@ def status_text(name: str, p: dict) -> str:
             if left:
                 line += f" · 剩约 {fmt_secs(left)}"
         lines.append(line)
-    ev = fmt_eval(p["evals"])
+    ev = fmt_eval(p.get("arm_evals", p["evals"]))
     if ev:
         lines.append(ev)
     if p["stage_done"]:
@@ -302,7 +311,13 @@ def advance(w: dict, now: float, timeout: int = 30) -> str:
         for ts, stage in p["stage_done"][rep.get("stage_done", 0):]:
             events.append(f"阶段 {stage} 全部收尾 ({ts[11:16]})")
         rep["stage_done"] = len(p["stage_done"])
-        w["finished"] = True
+        until = w.get("until") or ""
+        if not until or any(stage == until for _, stage in p["stage_done"]):
+            w["finished"] = True
+    if len(p["chain"]) > rep.get("chain", 0):
+        for ts, text in p["chain"][rep.get("chain", 0):]:
+            events.append(f"[自动接力 {ts[11:16]}] {text}")
+        rep["chain"] = len(p["chain"])
     if len(p["evals"]) > rep.get("evals", 0):
         rep["evals"] = len(p["evals"])
         val, epoch = p["evals"][-1]
@@ -411,6 +426,8 @@ def cmd_add(a: argparse.Namespace) -> int:
         raise SystemExit("要么给 --log <本地日志>, 要么给 --cmd '<取数命令>'")
     st = load_state()
     w = default_watch(a.name, a.log, a.cmd, a.every, a.idle, a.check)
+    if a.until:
+        w["until"] = a.until
     old = st["watches"].get(a.name)
     if old:
         w["created"] = old.get("created", w["created"])
@@ -418,7 +435,8 @@ def cmd_add(a: argparse.Namespace) -> int:
     st["watches"][a.name] = w
     save_state(st)
     print(f"[add] {a.name} → {a.cmd or a.log}")
-    print(f"      取数 {w['check']}s · 进度最小间隔 {w['every']}s · 心跳 {w['idle']}s")
+    print(f"      取数 {w['check']}s · 进度最小间隔 {w['every']}s · 心跳 {w['idle']}s"
+          + (f" · 直到阶段 {a.until} 收尾" if a.until else " · 任一阶段收尾即停"))
     if a.notify:
         notifier(a.chat)(f"[{a.name}] 开始看护\n{a.cmd or a.log}", "看护已开")
     return 0
@@ -615,6 +633,27 @@ def selftest() -> int:
     e, i, c = sane_windows(10, 3600, 0)
     chk(e == 60 and c == 0, "every 下限 60s, check=0 表示每 tick")
 
+    print("selftest: 多阶段接力")
+    box = {"text": ""}
+    real3 = globals()["probe"]
+    globals()["probe"] = lambda *_a, **_k: box["text"]
+    try:
+        t = 3_000_000.0
+        w4 = default_watch("t4", "", "", every=900, idle=3600, check=0)
+        w4["until"] = "b4"
+        box["text"] = "[arm 2026-11-10 23:00:00] b3_x ===\n[stage done 2026-11-11 03:15:00] b3\n"
+        m = advance(w4, t)
+        chk("阶段 b3" in m and not w4["finished"], "until=b4 时 b3 收尾不停")
+        box["text"] += "[chain 2026-11-11 03:16:00] b3 最优 b2_r64 alpha=128，启动 b4\n"
+        m = advance(w4, t + 10)
+        chk("[自动接力 03:16]" in m and "启动 b4" in m, "接力行原样转发")
+        chk(advance(w4, t + 20) == "", "同一接力行不重复转发")
+        box["text"] += "[stage done 2026-11-11 07:05:00] b4\n"
+        m = advance(w4, t + 30)
+        chk("阶段 b4" in m and w4["finished"], "until 阶段收尾后停")
+    finally:
+        globals()["probe"] = real3
+
     print("selftest: 名单读写")
     tmp = Path(".feishu_watch_selftest.json").resolve()
     global STATE_FILE
@@ -647,6 +686,8 @@ def main() -> int:
     a1.add_argument("--idle", type=int, default=3600, help="无变化时心跳间隔秒")
     a1.add_argument("--check", type=int, default=60, help="取数间隔秒")
     a1.add_argument("--notify", action="store_true", help="登记后立刻发一条确认")
+    a1.add_argument("--until", default="",
+                    help="直到这个阶段收尾才停 (多阶段接力时用, 例如 b4); 不给则任一阶段收尾即停")
     a1.add_argument("--chat", default="")
     a1.set_defaults(fn=cmd_add)
 
